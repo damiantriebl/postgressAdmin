@@ -3,14 +3,16 @@ PostgressAdmin
 Desktop client to manage and test PostgreSQL connections. Built with Tauri + React + TypeScript (Vite) and a native Rust backend for secure operations (e.g., credential vault and health checks).
 
 # Requirements (Windows):
-## - Node 18+ / PNPM or NPM
-## - Rust + stable toolchain + Tauri dependencies
-## - WebView2 Runtime
-## - MSVC/Build Tools (see SETUP_WINDOWS.md)
+ - Node 18+ / PNPM or NPM
+ - Rust + stable toolchain + Tauri dependencies
+ - WebView2 Runtime
+ - MSVC/Build Tools (see SETUP_WINDOWS.md)
 
+```
 pnpm i           # or npm i
 pnpm tauri dev   # or npx tauri dev
 pnpm tauri build # build binary
+```
 
 Features
 
@@ -57,9 +59,9 @@ cd postgressAdmin
 
 
 Install dependencies:
-
+```
 pnpm i   # or npm i
-
+```
 
 Optional .env configuration:
 
@@ -69,10 +71,11 @@ DATABASE_URL=postgres://user:pass@host:5432/dbname
 Install Windows dependencies (WebView2, Build Tools): see SETUP_WINDOWS.md
 
 Common Scripts
+```
 pnpm dev         # Frontend only (Vite)
 pnpm tauri dev   # Desktop app in dev mode
 pnpm tauri build # Build native binary
-
+```
 Development
 
 Frontend in src/ (React/TS)
