@@ -1,0 +1,2077 @@
+import { useState, useEffect, useRef } from "react";
+import { 
+  ChevronLeft, 
+  ChevronRight, 
+  Hash,
+  Clock,
+  Database,
+  Edit,
+  X,
+  Plus,
+  Trash2,
+  AlertTriangle,
+  Filter,
+  Upload,
+  Download
+} from "lucide-react";
+import { Button } from "@/components/ui/button";
+import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
+import { Badge } from "@/components/ui/badge";
+import { Alert, AlertDescription } from "@/components/ui/alert";
+import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
+import { Input } from "@/components/ui/input";
+// DropdownMenu imports removed as we now use ExportDialog
+import { QueryResult, ExportFormat, ExportOptions, DetailedColumnInfo, FilterCondition, SqlExportType, ImportOptions } from "@/types/database";
+import { DatabaseService } from "@/services/database";
+import { useToast } from "@/components/Toast";
+import { errorToString } from "@/utils/error";
+import EditableCell from "./EditableCell";
+import VirtualizedTable from "./VirtualizedTable";
+import { save, open } from '@tauri-apps/plugin-dialog';
+import ExportDialog from './ExportDialog';
+
+
+
+interface ResultsViewerProps {
+  queryResult: QueryResult | null;
+  isExecuting?: boolean;
+  onPageChange?: (page: number) => void;
+  onPageSizeChange?: (pageSize: number) => void;
+  onFilterChange?: (filters: FilterCondition[]) => void;
+  tableName?: string;
+  schemaName?: string;
+  enableEditing?: boolean;
+  onQueryResultUpdate?: (result: QueryResult) => void;
+  onOpenRelatedTable?: (tableName: string, schemaName: string, foreignKeyValue: any, columnName: string) => void;
+}
+
+export default function ResultsViewer({ 
+  queryResult, 
+  isExecuting = false,
+  onPageChange,
+  onPageSizeChange,
+  onFilterChange,
+  tableName,
+  schemaName,
+  enableEditing = false,
+  onQueryResultUpdate,
+  onOpenRelatedTable
+}: ResultsViewerProps) {
+  const { addToast } = useToast();
+  const [isExporting, setIsExporting] = useState(false);
+  const [isEditMode, setIsEditMode] = useState(false);
+  const [detailedColumns, setDetailedColumns] = useState<DetailedColumnInfo[]>([]);
+  const [enumValuesCache, setEnumValuesCache] = useState<Map<string, string[]>>(new Map());
+  const [foreignKeysInfo, setForeignKeysInfo] = useState<Map<string, any>>(new Map());
+  const [expandedRows, setExpandedRows] = useState<Map<number, {
+    tableName: string;
+    schemaName: string;
+    queryResult: QueryResult;
+    filterInfo: {
+      columnName: string;
+      value: any;
+      foreignKeyInfo: any;
+    };
+  }>>(new Map());
+  const [showInsertDialog, setShowInsertDialog] = useState(false);
+  const [showDeleteDialog, setShowDeleteDialog] = useState(false);
+  const [deleteRowIndex, setDeleteRowIndex] = useState<number | null>(null);
+  const [newRowData, setNewRowData] = useState<Record<string, any>>({});
+  const [isInserting, setIsInserting] = useState(false);
+  const [isDeleting, setIsDeleting] = useState(false);
+     const [useVirtualization, setUseVirtualization] = useState(false);
+   const bodyScrollRef = useRef<HTMLDivElement>(null);
+  
+  // Filter state
+  const [filters, setFilters] = useState<FilterCondition[]>([]);
+  const [showFilterDialog, setShowFilterDialog] = useState(false);
+  const [newFilter, setNewFilter] = useState<FilterCondition>({
+    column: '',
+    operator: '=',
+    value: ''
+  });
+  const [filterSuggestions, setFilterSuggestions] = useState<string[]>([]);
+  const [loadingSuggestions, setLoadingSuggestions] = useState(false);
+  const [filteredData, setFilteredData] = useState<QueryResult | null>(null);
+  const [showImportDialog, setShowImportDialog] = useState(false);
+  const [isImporting, setIsImporting] = useState(false);
+
+  // Performance optimization: Use virtualization for large datasets
+  const VIRTUALIZATION_THRESHOLD = 500; // Use virtualization for datasets with more than 500 rows
+
+  // Auto-enable virtualization for large datasets
+  useEffect(() => {
+    if (queryResult && queryResult.rows.length > VIRTUALIZATION_THRESHOLD) {
+      setUseVirtualization(true);
+    } else {
+      setUseVirtualization(false);
+    }
+  }, [queryResult]);
+
+  
+
+  // Cache for table metadata to avoid repeated queries
+  const [tableMetadataCache, setTableMetadataCache] = useState<Map<string, {
+    columns: DetailedColumnInfo[];
+    enumValues: Map<string, string[]>;
+    foreignKeys: Map<string, any>;
+  }>>(new Map());
+
+  // Load detailed column information when editing is enabled (optimized with caching)
+  useEffect(() => {
+    const loadDetailedColumns = async () => {
+      console.log('🔧 [ResultsViewer] loadDetailedColumns called with:', {
+        enableEditing,
+        tableName,
+        schemaName,
+        hasQueryResult: !!queryResult
+      });
+      
+      if (enableEditing && tableName && queryResult) {
+        const cacheKey = `${schemaName || 'public'}.${tableName}`;
+        
+        // Check cache first
+        const cachedMetadata = tableMetadataCache.get(cacheKey);
+        if (cachedMetadata) {
+          console.log('🔧 [ResultsViewer] Using cached metadata for:', cacheKey);
+          setDetailedColumns(cachedMetadata.columns);
+          setEnumValuesCache(cachedMetadata.enumValues);
+          setForeignKeysInfo(cachedMetadata.foreignKeys);
+          return;
+        }
+
+        try {
+          console.log('🔧 [ResultsViewer] Loading detailed columns for table:', tableName, schemaName);
+          
+          // Load all metadata in parallel for better performance
+          const [columns, foreignKeys] = await Promise.all([
+            DatabaseService.getDetailedTableColumns(tableName, schemaName),
+            DatabaseService.getTableForeignKeys(tableName, schemaName).catch(() => [])
+          ]);
+          
+          console.log('🔧 [ResultsViewer] Loaded detailed columns:', columns);
+          setDetailedColumns(columns);
+          
+          // Load enum values for enum columns (in parallel)
+          const enumColumns = columns.filter(col => 
+            !['int2', 'int4', 'int8', 'float4', 'float8', 'numeric', 'decimal', 'bool', 'boolean', 
+              'text', 'varchar', 'char', 'bpchar', 'date', 'time', 'timetz', 'timestamp', 'timestamptz',
+              'json', 'jsonb', 'uuid', 'bytea'].includes(col.data_type.toLowerCase())
+          );
+          
+          console.log('🔧 [ResultsViewer] Found enum columns:', enumColumns);
+          
+          const enumValuesMap = new Map();
+          if (enumColumns.length > 0) {
+            const enumPromises = enumColumns.map(async (col) => {
+              try {
+                const enumValues = await DatabaseService.getEnumValues(col.udt_name);
+                if (enumValues.length > 0) {
+                  console.log(`🔧 [ResultsViewer] Loaded enum values for ${col.udt_name}:`, enumValues);
+                  return [col.udt_name, enumValues];
+                }
+              } catch (error) {
+                console.warn(`Failed to load enum values for ${col.udt_name}:`, error);
+              }
+              return null;
+            });
+            
+            const enumResults = await Promise.all(enumPromises);
+            enumResults.forEach(result => {
+              if (result) {
+                enumValuesMap.set(result[0], result[1]);
+              }
+            });
+          }
+          setEnumValuesCache(enumValuesMap);
+
+          // Process foreign key information
+          console.log('🔧 [ResultsViewer] Loaded foreign keys:', foreignKeys);
+          const fkMap = new Map();
+          foreignKeys.forEach(fk => {
+            const fkInfo = {
+              referenced_table: fk.referenced_table,
+              referenced_column: fk.referenced_column,
+              referenced_schema: schemaName || 'public'
+            };
+            fkMap.set(fk.column_name, fkInfo);
+            console.log(`🔧 [ResultsViewer] Mapped FK: ${fk.column_name} -> ${fk.referenced_table}.${fk.referenced_column}`);
+          });
+          setForeignKeysInfo(fkMap);
+          console.log('🔧 [ResultsViewer] Final FK map:', Array.from(fkMap.entries()));
+
+          // Cache the metadata for future use
+          setTableMetadataCache(prev => new Map(prev.set(cacheKey, {
+            columns,
+            enumValues: enumValuesMap,
+            foreignKeys: fkMap
+          })));
+          
+        } catch (error) {
+          console.error('Failed to load detailed column information:', error);
+        }
+      } else {
+        console.log('🔧 [ResultsViewer] Not loading detailed columns - conditions not met');
+      }
+    };
+
+    loadDetailedColumns();
+  }, [enableEditing, tableName, schemaName, queryResult]);
+
+  // const handleExportResults = async (format: ExportFormat) => {
+    if (!displayData) {
+      return;
+    }
+
+    setIsExporting(true);
+    try {
+      // Show loading toast
+      addToast({
+        type: 'info',
+        title: 'Exporting Data',
+        message: `Preparing ${format} export...`,
+      });
+
+      let exportResult;
+      
+      // If we have a table name, export the entire table, otherwise export current results
+      if (tableName && schemaName && (format === ExportFormat.CSV || format === ExportFormat.JSON)) {
+        const exportOptions: ExportOptions = {
+          format,
+          include_headers: true,
+          pretty_json: format === ExportFormat.JSON,
+        };
+        
+        exportResult = await DatabaseService.exportTableAsCsvJson(tableName, exportOptions, schemaName);
+      } else {
+        // Export current results only
+        const exportOptions: ExportOptions = {
+          format,
+          include_headers: true,
+          pretty_json: format === ExportFormat.JSON,
+        };
+
+        exportResult = await DatabaseService.exportExistingResults(displayData, exportOptions);
+      }
+      
+      // Use save dialog to let user choose location
+      try {
+        const fileExtension = format === ExportFormat.CSV ? 'csv' : 'json';
+        const baseName = tableName || 'query_results';
+        const fileName = `${baseName}_${new Date().toISOString().slice(0, 19).replace(/:/g, '-')}.${fileExtension}`;
+        
+        const filePath = await save({
+          defaultPath: fileName,
+          filters: [{
+            name: `${format} Files`,
+            extensions: [fileExtension]
+          }, {
+            name: 'All Files',
+            extensions: ['*']
+          }]
+        });
+
+        if (filePath && typeof filePath === 'string') {
+          await DatabaseService.saveExportToFile(exportResult, filePath);
+          addToast({
+            type: 'success',
+            title: 'Export Successful',
+            message: `Data exported successfully to: ${filePath}`,
+          });
+        } else {
+          // User cancelled the dialog
+          addToast({
+            type: 'info',
+            title: 'Export Cancelled',
+            message: 'Export operation was cancelled by user.',
+          });
+        }
+      } catch (dialogError) {
+        console.error('Save dialog error:', dialogError);
+        
+        // Fallback: try to save to default location
+        const fileExtension = format === ExportFormat.CSV ? 'csv' : 'json';
+        const baseName = tableName || 'query_results';
+        const fileName = `${baseName}_${new Date().toISOString().slice(0, 19).replace(/:/g, '-')}.${fileExtension}`;
+        
+        try {
+          await DatabaseService.saveExportToFile(exportResult, fileName);
+          addToast({
+            type: 'success',
+            title: 'Export Successful',
+            message: `Data exported to: ${fileName} (Save dialog failed, used default location)`,
+          });
+        } catch (saveError) {
+          console.error('Fallback save failed:', saveError);
+          addToast({
+            type: 'error',
+            title: 'Export Failed',
+            message: `Failed to save file: ${errorToString(saveError)}`,
+          });
+        }
+      }
+    } catch (error) {
+      console.error('Export error:', error);
+      addToast({
+        type: 'error',
+        title: 'Export Failed',
+        message: errorToString(error),
+      });
+    } finally {
+      setIsExporting(false);
+    }
+  };
+
+  const handleExportSQL_unused = async (sqlType: SqlExportType) => {
+    if (!displayData || !tableName) {
+      addToast({
+        type: 'error',
+        title: 'Export Failed',
+        message: 'Table name is required for SQL export',
+      });
+      return;
+    }
+
+    setIsExporting(true);
+    try {
+      // Show loading toast
+      addToast({
+        type: 'info',
+        title: 'Exporting SQL',
+        message: `Preparing ${sqlType} SQL export for ${tableName}...`,
+      });
+
+      let exportResult;
+      
+      if (tableName && schemaName) {
+        // Export entire table
+        exportResult = await DatabaseService.exportTableAsSQL(tableName, schemaName, sqlType);
+      } else {
+        // Export query results
+        exportResult = await DatabaseService.exportQueryResultAsSQL(displayData, tableName, schemaName);
+      }
+      
+      // Use save dialog to let user choose location
+      try {
+        const sqlTypeMap = {
+          [SqlExportType.INSERT]: 'insert',
+          [SqlExportType.SEED]: 'seed',
+          [SqlExportType.FULL_BACKUP]: 'backup'
+        };
+        
+        const fileName = `${tableName}_${sqlTypeMap[sqlType]}_${new Date().toISOString().slice(0, 19).replace(/:/g, '-')}.sql`;
+        
+        const filePath = await save({
+          defaultPath: fileName,
+          filters: [{
+            name: 'SQL Files',
+            extensions: ['sql']
+          }, {
+            name: 'All Files',
+            extensions: ['*']
+          }]
+        });
+
+        if (filePath && typeof filePath === 'string') {
+          await DatabaseService.saveExportToFile(exportResult, filePath);
+          addToast({
+            type: 'success',
+            title: 'SQL Export Successful',
+            message: `SQL exported successfully to: ${filePath}`,
+          });
+        } else {
+          // User cancelled the dialog
+          addToast({
+            type: 'info',
+            title: 'Export Cancelled',
+            message: 'SQL export operation was cancelled by user.',
+          });
+        }
+      } catch (dialogError) {
+        console.error('Save dialog error:', dialogError);
+        
+        // Fallback: try to save to default location
+        const sqlTypeMap = {
+          [SqlExportType.INSERT]: 'insert',
+          [SqlExportType.SEED]: 'seed',
+          [SqlExportType.FULL_BACKUP]: 'backup'
+        };
+        
+        const fileName = `${tableName}_${sqlTypeMap[sqlType]}_${new Date().toISOString().slice(0, 19).replace(/:/g, '-')}.sql`;
+        
+        try {
+          await DatabaseService.saveExportToFile(exportResult, fileName);
+          addToast({
+            type: 'success',
+            title: 'SQL Export Successful',
+            message: `SQL exported to: ${fileName} (Save dialog failed, used default location)`,
+          });
+        } catch (saveError) {
+          console.error('Fallback save failed:', saveError);
+          addToast({
+            type: 'error',
+            title: 'SQL Export Failed',
+            message: `Failed to save file: ${errorToString(saveError)}`,
+          });
+        }
+      }
+    } catch (error) {
+      console.error('SQL export error:', error);
+      addToast({
+        type: 'error',
+        title: 'SQL Export Failed',
+        message: errorToString(error),
+      });
+    } finally {
+      setIsExporting(false);
+    }
+  };
+
+  const handleImportSQL = async () => {
+    setShowImportDialog(true);
+  };
+
+  const handleImportFile = async () => {
+    try {
+      // Use Tauri's open dialog
+      const filePath = await open({
+        multiple: false,
+        filters: [{
+          name: 'SQL Files',
+          extensions: ['sql']
+        }]
+      });
+
+      if (filePath) {
+        setIsImporting(true);
+        
+        // Import options
+        const importOptions: ImportOptions = {
+          format: ExportFormat.SQL,
+          table_name: tableName,
+          schema_name: schemaName,
+          truncate_before_import: false,
+          create_table_if_not_exists: false
+        };
+
+        // Use a backend command that reads the file and imports it
+        const result = await DatabaseService.importSQLFromFile(filePath as string, importOptions);
+
+        if (result.success) {
+          addToast({
+            type: 'success',
+            title: 'Import Successful',
+            message: `Successfully imported ${result.rows_imported} rows`,
+          });
+
+          // Refresh the table data if we're viewing a table
+          if (onQueryResultUpdate && tableName) {
+            try {
+              const refreshedResult = await DatabaseService.queryTable(tableName, schemaName);
+              onQueryResultUpdate(refreshedResult);
+            } catch (error) {
+              console.warn('Failed to refresh table data after import:', error);
+            }
+          }
+        } else {
+          addToast({
+            type: 'error',
+            title: 'Import Failed',
+            message: `Import failed with ${result.errors.length} errors: ${result.errors.join(', ')}`,
+          });
+        }
+
+        setShowImportDialog(false);
+      }
+    } catch (error) {
+      addToast({
+        type: 'error',
+        title: 'Import Failed',
+        message: errorToString(error),
+      });
+    } finally {
+      setIsImporting(false);
+    }
+  };
+
+  const handlePageChange = (newPage: number) => {
+    if (queryResult?.pagination && onPageChange) {
+      onPageChange(newPage);
+    }
+  };
+
+  const handlePageSizeChange = (newPageSize: string) => {
+    if (onPageSizeChange) {
+      onPageSizeChange(parseInt(newPageSize));
+    }
+  };
+
+  const toggleEditMode = () => {
+    setIsEditMode(!isEditMode);
+  };
+
+  const handleOpenRelatedTableInline = async (rowIndex: number, tableName: string, schemaName: string, foreignKeyValue: any, columnName: string, foreignKeyInfo: any) => {
+    console.log('🔗 [ResultsViewer] Opening related table inline:', {
+      rowIndex,
+      tableName,
+      schemaName,
+      foreignKeyValue,
+      columnName
+    });
+
+    // Check if this row already has an expanded table
+    if (expandedRows.has(rowIndex)) {
+      // Close the expanded row
+      setExpandedRows(prev => {
+        const newMap = new Map(prev);
+        newMap.delete(rowIndex);
+        return newMap;
+      });
+      return;
+    }
+
+    try {
+      // Build the actual query with the parameter value
+      let actualQuery: string;
+      if (typeof foreignKeyValue === 'string') {
+        actualQuery = `SELECT * FROM "${schemaName}"."${tableName}" WHERE "${columnName}" = '${foreignKeyValue}' LIMIT 100;`;
+      } else if (foreignKeyValue === null) {
+        actualQuery = `SELECT * FROM "${schemaName}"."${tableName}" WHERE "${columnName}" IS NULL LIMIT 100;`;
+      } else {
+        actualQuery = `SELECT * FROM "${schemaName}"."${tableName}" WHERE "${columnName}" = ${foreignKeyValue} LIMIT 100;`;
+      }
+
+      console.log('🔗 [ResultsViewer] Executing inline query:', actualQuery);
+      const result = await DatabaseService.executeQuery(actualQuery);
+      
+      console.log('🔗 [ResultsViewer] Inline query executed successfully:', {
+        rowsCount: result.rows.length,
+        executionTime: result.execution_time_ms
+      });
+
+      // Add the related table result to the expanded rows
+      setExpandedRows(prev => new Map(prev.set(rowIndex, {
+        tableName,
+        schemaName,
+        queryResult: result,
+        filterInfo: {
+          columnName,
+          value: foreignKeyValue,
+          foreignKeyInfo
+        }
+      })));
+
+    } catch (error) {
+      console.error('🚨 [ResultsViewer] Error executing inline related table query:', error);
+      addToast({
+        type: 'error',
+        title: 'Failed to load related table',
+        message: `Could not load ${tableName}: ${error}`,
+      });
+    }
+  };
+
+  const updateCellValue = async (rowIndex: number, columnIndex: number, newValue: any) => {
+    console.log('🔧 [ResultsViewer] updateCellValue called:', { rowIndex, columnIndex, newValue });
+    
+    if (!queryResult || !tableName) return;
+    
+    try {
+      // Get primary key columns for the update
+      const primaryKeyColumns = detailedColumns
+        .filter(col => col.is_primary_key)
+        .map(col => col.name);
+      
+      if (primaryKeyColumns.length === 0) {
+        addToast({
+          type: 'error',
+          title: 'Update Failed',
+          message: 'Cannot update row: No primary key found in table',
+        });
+        return;
+      }
+
+      // Get primary key values from the current row
+      const primaryKeyValues = primaryKeyColumns.map(pkCol => {
+        const pkIndex = queryResult.columns.indexOf(pkCol);
+        return pkIndex >= 0 ? queryResult.rows[rowIndex][pkIndex] : null;
+      });
+
+      // Get the column name being updated
+      const columnName = queryResult.columns[columnIndex];
+      const columnUpdates = { [columnName]: newValue };
+
+      console.log('🔧 [ResultsViewer] Updating database:', {
+        tableName,
+        schemaName,
+        primaryKeyColumns,
+        primaryKeyValues,
+        columnUpdates
+      });
+
+      // Update the database
+      const rowsAffected = await DatabaseService.updateRow(
+        tableName,
+        schemaName,
+        primaryKeyColumns,
+        primaryKeyValues,
+        columnUpdates
+      );
+
+      if (rowsAffected > 0) {
+        // Update the query result locally
+        const updatedRows = [...queryResult.rows];
+        updatedRows[rowIndex] = [...updatedRows[rowIndex]];
+        updatedRows[rowIndex][columnIndex] = newValue;
+        
+        const updatedResult = {
+          ...queryResult,
+          rows: updatedRows
+        };
+
+        // Notify parent component of the update
+        if (onQueryResultUpdate) {
+          onQueryResultUpdate(updatedResult);
+        }
+
+        addToast({
+          type: 'success',
+          title: 'Cell Updated',
+          message: `Successfully updated ${columnName} in ${tableName}`,
+        });
+      } else {
+        addToast({
+          type: 'warning',
+          title: 'No Changes',
+          message: 'No rows were affected by the update',
+        });
+      }
+    } catch (error) {
+      console.error('🔧 [ResultsViewer] Database update failed:', error);
+      addToast({
+        type: 'error',
+        title: 'Update Failed',
+        message: errorToString(error),
+      });
+    }
+  };
+
+  const handleInsertRow = () => {
+    if (!queryResult || !tableName) return;
+    
+    // Initialize new row data with default values
+    const initialData: Record<string, any> = {};
+    detailedColumns.forEach(col => {
+      if (col.default_value) {
+        // Parse default value if it exists
+        try {
+          if (col.default_value.includes('nextval(')) {
+            // Skip auto-increment columns
+            initialData[col.name] = null;
+          } else {
+            initialData[col.name] = col.default_value;
+          }
+        } catch {
+          initialData[col.name] = col.default_value;
+        }
+      } else if (!col.is_nullable) {
+        // Set empty string for required fields
+        initialData[col.name] = '';
+      } else {
+        // Set null for nullable fields
+        initialData[col.name] = null;
+      }
+    });
+    
+    setNewRowData(initialData);
+    setShowInsertDialog(true);
+  };
+
+  const handleInsertConfirm = async () => {
+    if (!tableName) return;
+    
+    setIsInserting(true);
+    try {
+      // Filter out null values for columns that have defaults or are auto-generated
+      const filteredData: Record<string, any> = {};
+      Object.entries(newRowData).forEach(([key, value]) => {
+        const column = detailedColumns.find(col => col.name === key);
+        if (column && value !== null && value !== undefined && value !== '') {
+          filteredData[key] = value;
+        } else if (column && !column.is_nullable && value !== null && value !== undefined) {
+          // Include non-null values for required columns
+          filteredData[key] = value;
+        }
+      });
+
+      console.log('🔧 [ResultsViewer] Inserting new row:', {
+        tableName,
+        schemaName,
+        columnValues: filteredData
+      });
+
+      const rowsAffected = await DatabaseService.insertRow(
+        tableName,
+        schemaName,
+        filteredData
+      );
+
+      if (rowsAffected > 0) {
+        addToast({
+          type: 'success',
+          title: 'Row Inserted',
+          message: `Successfully inserted new row into ${tableName}`,
+        });
+        
+        // Refresh the table data by re-querying
+        if (onQueryResultUpdate) {
+          try {
+            const refreshedResult = await DatabaseService.queryTable(tableName, schemaName);
+            onQueryResultUpdate(refreshedResult);
+          } catch (error) {
+            console.warn('Failed to refresh table data after insert:', error);
+          }
+        }
+      } else {
+        addToast({
+          type: 'warning',
+          title: 'No Changes',
+          message: 'No rows were inserted',
+        });
+      }
+      
+      setShowInsertDialog(false);
+      setNewRowData({});
+    } catch (error) {
+      console.error('🔧 [ResultsViewer] Insert failed:', error);
+      addToast({
+        type: 'error',
+        title: 'Insert Failed',
+        message: errorToString(error),
+      });
+    } finally {
+      setIsInserting(false);
+    }
+  };
+
+  const handleDeleteRow = (rowIndex: number) => {
+    setDeleteRowIndex(rowIndex);
+    setShowDeleteDialog(true);
+  };
+
+  const handleDeleteConfirm = async () => {
+    if (!queryResult || !tableName || deleteRowIndex === null) return;
+    
+    setIsDeleting(true);
+    try {
+      // Get primary key columns for the delete
+      const primaryKeyColumns = detailedColumns
+        .filter(col => col.is_primary_key)
+        .map(col => col.name);
+      
+      if (primaryKeyColumns.length === 0) {
+        addToast({
+          type: 'error',
+          title: 'Delete Failed',
+          message: 'Cannot delete row: No primary key found in table',
+        });
+        return;
+      }
+
+      // Get primary key values from the row to delete
+      const primaryKeyValues = primaryKeyColumns.map(pkCol => {
+        const pkIndex = queryResult.columns.indexOf(pkCol);
+        return pkIndex >= 0 ? queryResult.rows[deleteRowIndex][pkIndex] : null;
+      });
+
+      console.log('🔧 [ResultsViewer] Deleting row:', {
+        tableName,
+        schemaName,
+        primaryKeyColumns,
+        primaryKeyValues
+      });
+
+      const rowsAffected = await DatabaseService.deleteRow(
+        tableName,
+        schemaName,
+        primaryKeyColumns,
+        primaryKeyValues
+      );
+
+      if (rowsAffected > 0) {
+        // Remove the row from the local query result
+        const updatedRows = [...queryResult.rows];
+        updatedRows.splice(deleteRowIndex, 1);
+        
+        const updatedResult = {
+          ...queryResult,
+          rows: updatedRows,
+          row_count: updatedRows.length
+        };
+
+        // Notify parent component of the update
+        if (onQueryResultUpdate) {
+          onQueryResultUpdate(updatedResult);
+        }
+
+        addToast({
+          type: 'success',
+          title: 'Row Deleted',
+          message: `Successfully deleted row from ${tableName}`,
+        });
+      } else {
+        addToast({
+          type: 'warning',
+          title: 'No Changes',
+          message: 'No rows were deleted',
+        });
+      }
+      
+      setShowDeleteDialog(false);
+      setDeleteRowIndex(null);
+    } catch (error) {
+      console.error('🔧 [ResultsViewer] Delete failed:', error);
+      addToast({
+        type: 'error',
+        title: 'Delete Failed',
+        message: errorToString(error),
+      });
+    } finally {
+      setIsDeleting(false);
+    }
+  };
+
+  // Transaction support is available through DatabaseService.executeTransaction()
+  // This can be used for batch operations that need to be atomic
+
+  // Filter handlers
+  const handleAddFilter = () => {
+    if (newFilter.column && newFilter.operator && (newFilter.value || newFilter.operator.includes('NULL'))) {
+      const updatedFilters = [...filters, newFilter];
+      setFilters(updatedFilters);
+      setNewFilter({ column: '', operator: '=', value: '' });
+      setFilterSuggestions([]);
+      setShowFilterDialog(false);
+      
+      // Notify parent component of filter change
+      if (onFilterChange) {
+        onFilterChange(updatedFilters);
+      }
+    }
+  };
+
+  const handleRemoveFilter = (index: number) => {
+    const updatedFilters = filters.filter((_, i) => i !== index);
+    setFilters(updatedFilters);
+    
+    // Notify parent component of filter change
+    if (onFilterChange) {
+      onFilterChange(updatedFilters);
+    }
+  };
+
+  const handleClearFilters = () => {
+    setFilters([]);
+    if (onFilterChange) {
+      onFilterChange([]);
+    }
+  };
+
+  const loadFilterSuggestions = async (columnName: string) => {
+    if (!queryResult || !tableName) return;
+    
+    setLoadingSuggestions(true);
+    try {
+      const columnInfo = detailedColumns.find(col => col.name === columnName);
+      if (!columnInfo) return;
+
+      let suggestions: string[] = [];
+
+      // Handle boolean columns
+      if (columnInfo.data_type.toLowerCase().includes('bool')) {
+        suggestions = ['true', 'false'];
+      }
+      // Handle enum columns
+      else if (enumValuesCache.has(columnInfo.udt_name)) {
+        suggestions = enumValuesCache.get(columnInfo.udt_name) || [];
+      }
+      // Handle foreign key columns
+      else if (columnInfo.is_foreign_key && foreignKeysInfo.has(columnName)) {
+        const fkInfo = foreignKeysInfo.get(columnName);
+        if (fkInfo) {
+          try {
+            // First, try to get text columns for display (more comprehensive search)
+            const textColumnsQuery = `
+              SELECT column_name 
+              FROM information_schema.columns 
+              WHERE table_name = '${fkInfo.referenced_table}' 
+              AND table_schema = '${fkInfo.referenced_schema}' 
+              AND (data_type IN ('text', 'varchar', 'char', 'name', 'character varying') 
+                   OR column_name ILIKE '%name%' 
+                   OR column_name ILIKE '%title%' 
+                   OR column_name ILIKE '%description%'
+                   OR column_name ILIKE '%label%')
+              AND column_name != '${fkInfo.referenced_column}'
+              ORDER BY 
+                CASE 
+                  WHEN column_name ILIKE '%name%' THEN 1
+                  WHEN column_name ILIKE '%title%' THEN 2
+                  WHEN column_name ILIKE '%label%' THEN 3
+                  ELSE 4
+                END,
+                ordinal_position
+              LIMIT 1;
+            `;
+            
+            let displayColumn = null;
+            try {
+              const textColResult = await DatabaseService.executeQuery(textColumnsQuery);
+              if (textColResult.rows.length > 0) {
+                displayColumn = textColResult.rows[0][0];
+                console.log(`Found display column for ${fkInfo.referenced_table}: ${displayColumn}`);
+              }
+            } catch (e) {
+              console.warn('Could not find text column for display:', e);
+            }
+
+            // Get distinct values from the referenced table
+            let query: string;
+            if (displayColumn) {
+              query = `
+                SELECT DISTINCT "${fkInfo.referenced_column}" as value,
+                       COALESCE("${displayColumn}"::text, 'No name') as display
+                FROM "${fkInfo.referenced_schema}"."${fkInfo.referenced_table}"
+                WHERE "${fkInfo.referenced_column}" IS NOT NULL
+                ORDER BY value
+                LIMIT 20;
+              `;
+            } else {
+              query = `
+                SELECT DISTINCT "${fkInfo.referenced_column}" as value
+                FROM "${fkInfo.referenced_schema}"."${fkInfo.referenced_table}"
+                WHERE "${fkInfo.referenced_column}" IS NOT NULL
+                ORDER BY value
+                LIMIT 20;
+              `;
+            }
+            
+            console.log(`Executing FK suggestion query: ${query}`);
+            const result = await DatabaseService.executeQuery(query);
+            
+            if (displayColumn && result.rows.length > 0) {
+              suggestions = result.rows.map(row => `${row[0]} (${row[1] || 'No name'})`);
+              console.log(`Generated FK suggestions with display names:`, suggestions.slice(0, 3));
+            } else {
+              suggestions = result.rows.map(row => String(row[0]));
+              console.log(`Generated FK suggestions without display names:`, suggestions.slice(0, 3));
+            }
+          } catch (error) {
+            console.warn('Failed to load foreign key suggestions:', error);
+            // Fallback to distinct values from current result set
+            const uniqueValues = [...new Set(queryResult.rows.map(row => {
+              const colIndex = queryResult.columns.indexOf(columnName);
+              return row[colIndex];
+            }).filter(val => val !== null && val !== undefined))];
+            suggestions = uniqueValues.slice(0, 10).map(val => String(val));
+          }
+        }
+      }
+      // Handle other columns - get distinct values from current result set
+      else {
+        const colIndex = queryResult.columns.indexOf(columnName);
+        if (colIndex >= 0) {
+          const uniqueValues = [...new Set(queryResult.rows.map(row => row[colIndex])
+            .filter(val => val !== null && val !== undefined))]
+            .slice(0, 10)
+            .map(val => String(val));
+          suggestions = uniqueValues;
+        }
+      }
+
+      setFilterSuggestions(suggestions);
+    } catch (error) {
+      console.error('Failed to load filter suggestions:', error);
+      setFilterSuggestions([]);
+    } finally {
+      setLoadingSuggestions(false);
+    }
+  };
+
+  const handleColumnChange = (columnName: string) => {
+    setNewFilter(prev => ({ ...prev, column: columnName, value: '' }));
+    loadFilterSuggestions(columnName);
+  };
+
+  // Apply filters locally to the data
+  const applyFilters = (data: QueryResult, filtersToApply: FilterCondition[]): QueryResult => {
+    if (!filtersToApply.length || !data) return data;
+
+    const filteredRows = data.rows.filter(row => {
+      return filtersToApply.every(filter => {
+        const columnIndex = data.columns.indexOf(filter.column);
+        if (columnIndex === -1) return true;
+
+        const cellValue = row[columnIndex];
+        const filterValue = filter.value;
+
+        switch (filter.operator) {
+          case '=':
+            return String(cellValue) === String(filterValue);
+          case '!=':
+            return String(cellValue) !== String(filterValue);
+          case '>':
+            if (typeof cellValue === 'number' && !isNaN(Number(filterValue))) {
+              return cellValue > Number(filterValue);
+            }
+            return String(cellValue) > String(filterValue);
+          case '<':
+            if (typeof cellValue === 'number' && !isNaN(Number(filterValue))) {
+              return cellValue < Number(filterValue);
+            }
+            return String(cellValue) < String(filterValue);
+          case '>=':
+            if (typeof cellValue === 'number' && !isNaN(Number(filterValue))) {
+              return cellValue >= Number(filterValue);
+            }
+            return String(cellValue) >= String(filterValue);
+          case '<=':
+            if (typeof cellValue === 'number' && !isNaN(Number(filterValue))) {
+              return cellValue <= Number(filterValue);
+            }
+            return String(cellValue) <= String(filterValue);
+          case 'LIKE':
+            return String(cellValue).toLowerCase().includes(String(filterValue).toLowerCase());
+          case 'ILIKE':
+            return String(cellValue).toLowerCase().includes(String(filterValue).toLowerCase());
+          case 'IS NULL':
+            return cellValue === null || cellValue === undefined;
+          case 'IS NOT NULL':
+            return cellValue !== null && cellValue !== undefined;
+          default:
+            return true;
+        }
+      });
+    });
+
+    return {
+      ...data,
+      rows: filteredRows,
+      row_count: filteredRows.length
+    };
+  };
+
+  // Update filtered data when filters or queryResult change
+  useEffect(() => {
+    if (queryResult) {
+      const filtered = applyFilters(queryResult, filters);
+      setFilteredData(filtered);
+    } else {
+      setFilteredData(null);
+    }
+  }, [queryResult, filters]);
+
+  const formatCellValue = (value: any): string => {
+    if (value === null || value === undefined) {
+      return 'NULL';
+    }
+    if (typeof value === 'object') {
+      return JSON.stringify(value);
+    }
+    if (typeof value === 'boolean') {
+      return value ? 'true' : 'false';
+    }
+    return String(value);
+  };
+
+  const getCellClassName = (value: any): string => {
+    if (value === null || value === undefined) {
+      return 'text-gray-500 italic';
+    }
+    if (typeof value === 'number') {
+      return 'text-blue-300 font-mono';
+    }
+    if (typeof value === 'boolean') {
+      return value ? 'text-green-300' : 'text-red-300';
+    }
+    if (typeof value === 'object') {
+      return 'text-purple-300 font-mono text-xs';
+    }
+    return 'text-gray-200';
+  };
+
+  if (isExecuting) {
+    return (
+      <div className="w-full">
+        <Card className="bg-gray-800/90 backdrop-blur-sm border-gray-700/50 shadow-xl w-full">
+          <CardContent className="flex items-center justify-center py-12">
+            <div className="text-center">
+              <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-blue-400 mx-auto mb-4"></div>
+              <p className="text-gray-400">Executing query...</p>
+            </div>
+          </CardContent>
+        </Card>
+      </div>
+    );
+  }
+
+  if (!queryResult) {
+    return (
+      <div className="w-full">
+        <Card className="bg-gray-800/90 backdrop-blur-sm border-gray-700/50 shadow-xl w-full">
+          <CardContent className="flex items-center justify-center py-12">
+            <div className="text-center">
+              <Database className="h-12 w-12 text-gray-600 mx-auto mb-4" />
+              <p className="text-gray-400">No query results to display</p>
+              <p className="text-gray-500 text-sm mt-2">Execute a query to see results here</p>
+            </div>
+          </CardContent>
+        </Card>
+      </div>
+    );
+  }
+
+  // Use filtered data for display, but keep original pagination info
+  const displayData = filteredData || queryResult;
+  const currentPage = queryResult?.pagination?.current_page || 1;
+  const pageSize = queryResult?.pagination?.page_size || (displayData?.rows.length || 0);
+  const totalRows = queryResult?.pagination?.total_rows;
+  const hasMore = queryResult?.pagination?.has_more || false;
+  const totalPages = totalRows ? Math.ceil(totalRows / pageSize) : (hasMore ? currentPage + 1 : currentPage);
+
+  return (
+    <div className="w-full space-y-4">
+      <Card className="bg-gray-800/90 backdrop-blur-sm border-gray-700/50 shadow-xl hover:bg-gray-800 transition-all duration-200 w-full">
+        <CardHeader className="pb-4">
+          <div className="flex items-center justify-between mb-4">
+            <CardTitle className="flex items-center space-x-2 text-lg text-white">
+              <Database className="h-5 w-5 text-purple-400" />
+              <span>Query Results</span>
+            </CardTitle>
+            <div className="flex items-center space-x-4 text-sm text-gray-400">
+              <div className="flex items-center space-x-1">
+                <Clock className="h-4 w-4" />
+                <span>{queryResult.execution_time_ms}ms</span>
+              </div>
+              <div className="flex items-center space-x-1">
+                <Hash className="h-4 w-4" />
+                <span>
+                  {filters.length > 0 
+                    ? `${displayData?.rows.length || 0} filtered rows` + 
+                      (queryResult?.pagination?.total_rows ? ` (of ${queryResult.pagination.total_rows.toLocaleString()} total)` : '')
+                    : queryResult?.pagination?.total_rows !== undefined 
+                      ? `${queryResult.rows.length} of ${queryResult.pagination.total_rows.toLocaleString()} rows`
+                      : `${displayData?.rows.length || 0} rows`
+                  }
+                </span>
+              </div>
+              <Badge variant="secondary" className="text-xs">
+                {queryResult?.query_type}
+              </Badge>
+            </div>
+          </div>
+          
+          {/* Unified toolbar with all controls */}
+          <div className="flex items-center justify-between bg-gray-900/50 border border-gray-700 rounded-lg p-3">
+            <div className="flex items-center space-x-4">
+              {/* Filter controls */}
+              <div className="flex items-center space-x-2">
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={() => setShowFilterDialog(true)}
+                  className="border-gray-600 text-gray-300 hover:bg-gray-700"
+                >
+                  <Filter className="h-4 w-4 mr-1" />
+                  Filter
+                </Button>
+                {filters.length > 0 && (
+                  <Badge variant="secondary" className="text-xs">
+                    {filters.length} filter{filters.length > 1 ? 's' : ''}
+                  </Badge>
+                )}
+              </div>
+
+              {/* Page size selector */}
+              <div className="flex items-center space-x-2">
+                <span className="text-sm text-gray-400">Show:</span>
+                <Select value={pageSize.toString()} onValueChange={handlePageSizeChange}>
+                  <SelectTrigger className="w-24 bg-gray-900/50 border-gray-600 text-white">
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent className="bg-gray-800 border-gray-600">
+                    <SelectItem value="50">50</SelectItem>
+                    <SelectItem value="100">100</SelectItem>
+                    <SelectItem value="250">250</SelectItem>
+                    <SelectItem value="999999">All</SelectItem>
+                  </SelectContent>
+                </Select>
+              </div>
+
+              {/* Pagination controls */}
+              {queryResult?.pagination && totalPages > 1 && filters.length === 0 && (
+                <div className="flex items-center space-x-2">
+                  <span className="text-sm text-gray-400">
+                    Page {currentPage} of {totalPages}
+                  </span>
+                  <div className="flex space-x-1">
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      onClick={() => handlePageChange(currentPage - 1)}
+                      disabled={currentPage <= 1}
+                      className="border-gray-600 text-gray-300 hover:bg-gray-700 h-8 w-8 p-0"
+                    >
+                      <ChevronLeft className="h-4 w-4" />
+                    </Button>
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      onClick={() => handlePageChange(currentPage + 1)}
+                      disabled={!hasMore && (!totalRows || currentPage >= totalPages)}
+                      className="border-gray-600 text-gray-300 hover:bg-gray-700 h-8 w-8 p-0"
+                    >
+                      <ChevronRight className="h-4 w-4" />
+                    </Button>
+                  </div>
+                </div>
+              )}
+            </div>
+
+            {/* Action buttons */}
+            <div className="flex space-x-2">
+              {enableEditing && (
+                <>
+                  <Button
+                    variant={isEditMode ? "default" : "outline"}
+                    size="sm"
+                    onClick={toggleEditMode}
+                    disabled={(displayData?.rows.length || 0) === 0}
+                    className={isEditMode 
+                      ? "bg-blue-600 text-white hover:bg-blue-700" 
+                      : "border-gray-600 text-gray-300 hover:bg-gray-700"
+                    }
+                  >
+                    {isEditMode ? <X className="h-4 w-4 mr-1" /> : <Edit className="h-4 w-4 mr-1" />}
+                    {isEditMode ? 'Exit Edit' : 'Edit'}
+                  </Button>
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    onClick={handleInsertRow}
+                    disabled={!tableName || detailedColumns.length === 0}
+                    className="border-green-600 text-green-300 hover:bg-green-700/20"
+                  >
+                    <Plus className="h-4 w-4 mr-1" />
+                    Insert
+                  </Button>
+                </>
+              )}
+              <ExportDialog
+                data={displayData}
+                tableName={tableName}
+                schemaName={schemaName}
+                exportType={tableName ? "table" : "query"}
+                trigger={
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    disabled={isExporting || (displayData?.rows.length || 0) === 0}
+                    className="border-gray-600 text-gray-300 hover:bg-gray-700"
+                  >
+                    <Download className="h-4 w-4 mr-1" />
+                    Export Data
+                  </Button>
+                }
+              />
+              {tableName && (
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={handleImportSQL}
+                  disabled={isImporting}
+                  className="border-green-600 text-green-300 hover:bg-green-700/20"
+                >
+                  <Upload className="h-4 w-4 mr-1" />
+                  Import SQL
+                </Button>
+              )}
+            </div>
+          </div>
+        </CardHeader>
+        <CardContent className="space-y-4">
+          {(displayData?.rows.length || 0) === 0 ? (
+            <Alert className="glass-effect border-blue-500/20 bg-blue-500/10">
+              <Database className="h-4 w-4 text-blue-400" />
+              <AlertDescription className="text-blue-300">
+                Query executed successfully but returned no rows.
+              </AlertDescription>
+            </Alert>
+          ) : (
+            <>
+              {/* Edit mode status */}
+              {isEditMode && (
+                <div className="flex items-center justify-between p-3 bg-blue-900/20 border border-blue-500/30 rounded-lg">
+                  <div className="flex items-center space-x-2">
+                    <Edit className="h-4 w-4 text-blue-400" />
+                    <span className="text-blue-300 font-medium">Edit Mode Active</span>
+                  </div>
+                  <div className="text-xs text-gray-400">
+                    Click any cell to edit • Enter to save • Escape to cancel
+                  </div>
+                </div>
+              )}
+
+              {/* Active filters status */}
+              {filters.length > 0 && (
+                <div className="flex items-center justify-between p-3 bg-purple-900/20 border border-purple-500/30 rounded-lg">
+                  <div className="flex items-center space-x-2">
+                    <Filter className="h-4 w-4 text-purple-400" />
+                    <span className="text-purple-300 font-medium">
+                      {filters.length} Active Filter{filters.length > 1 ? 's' : ''}
+                    </span>
+                  </div>
+                  <div className="flex items-center space-x-2">
+                    <div className="text-xs text-gray-400">
+                      {filters.map((filter, index) => (
+                        <span key={index} className="inline-block bg-gray-800 px-2 py-1 rounded mr-1">
+                          {filter.column} {filter.operator} {filter.operator.includes('NULL') ? '' : filter.value}
+                        </span>
+                      ))}
+                    </div>
+                    <Button
+                      variant="ghost"
+                      size="sm"
+                      onClick={handleClearFilters}
+                      className="h-6 text-purple-400 hover:text-purple-300 hover:bg-purple-400/10"
+                    >
+                      Clear All
+                    </Button>
+                  </div>
+                </div>
+              )}
+
+
+
+              {/* Results table */}
+              <div className="rounded-lg border border-gray-700 w-full">
+                {/* Performance indicator */}
+                {useVirtualization && (
+                  <div className="bg-blue-900/20 border-b border-blue-500/30 px-3 py-2">
+                    <div className="flex items-center space-x-2 text-xs text-blue-300">
+                      <div className="w-2 h-2 bg-blue-400 rounded-full animate-pulse"></div>
+                      <span>Performance mode: Virtualized rendering for {queryResult.rows.length.toLocaleString()} rows</span>
+                    </div>
+                  </div>
+                )}
+
+                {useVirtualization ? (
+                  /* Virtualized table for large datasets */
+                  <VirtualizedTable
+                    columns={displayData?.columns || []}
+                    rows={displayData?.rows || []}
+                    height={600}
+                    rowHeight={40}
+                    onCellClick={(rowIndex, columnIndex, value) => {
+                      if (isEditMode) {
+                        // Handle edit mode clicks
+                        console.log('Virtualized table cell clicked in edit mode:', { rowIndex, columnIndex, value });
+                      } else {
+                        // Handle foreign key navigation
+                        const columnInfo = detailedColumns[columnIndex];
+                        const foreignKeyInfo = columnInfo ? foreignKeysInfo.get(columnInfo.name) : undefined;
+                        
+                        if (columnInfo?.is_foreign_key && foreignKeyInfo && value !== null && value !== undefined) {
+                          handleOpenRelatedTableInline(
+                            rowIndex,
+                            foreignKeyInfo.referenced_table,
+                            foreignKeyInfo.referenced_schema || 'public',
+                            value,
+                            foreignKeyInfo.referenced_column,
+                            foreignKeyInfo
+                          );
+                        }
+                      }
+                    }}
+                    getCellClassName={getCellClassName}
+                    formatCellValue={formatCellValue}
+                  />
+                ) : (
+                  /* Standard table for smaller datasets */
+                  <div 
+                    ref={bodyScrollRef}
+                    className="overflow-auto h-[75vh] w-full custom-scrollbar"
+                  >
+                    <Table className="w-full min-w-full">
+                      <TableHeader className="sticky top-0 z-40 bg-gray-900 border-b-2 border-gray-700">
+                        <TableRow>
+                          {enableEditing && isEditMode && (
+                            <TableHead className="w-12 px-2 py-3 border-r border-gray-700 bg-gray-900">
+                              <span className="text-xs text-gray-300 font-medium">Actions</span>
+                            </TableHead>
+                          )}
+                          {(displayData?.columns || []).map((columnName, index) => {
+                            const columnInfo = detailedColumns.find(col => col.name === columnName);
+                            return (
+                              <TableHead 
+                                key={index} 
+                                className="min-w-[120px] px-3 py-3 border-r border-gray-700 last:border-r-0 bg-gray-900"
+                              >
+                                <div className="flex flex-col">
+                                  <div className="flex items-center space-x-1">
+                                    <span className="font-semibold text-white text-sm">{columnName}</span>
+                                    {columnInfo?.is_primary_key && (
+                                      <span className="text-yellow-400 text-xs" title="Primary Key">🔑</span>
+                                    )}
+                                    {columnInfo?.is_foreign_key && (
+                                      <span className="text-purple-400 text-xs" title="Foreign Key">🔗</span>
+                                    )}
+                                  </div>
+                                  <span className="text-xs text-gray-400 font-normal">
+                                    {columnInfo?.data_type || 'unknown'} {columnInfo?.is_nullable !== false ? '(nullable)' : '(not null)'}
+                                  </span>
+                                </div>
+                              </TableHead>
+                            );
+                          })}
+                        </TableRow>
+                      </TableHeader>
+                          <TableBody>
+                      {(displayData?.rows || []).map((row, rowIndex) => (
+                        <>
+                          {/* Main row */}
+                          <TableRow 
+                            key={rowIndex} 
+                            className="border-gray-700 hover:bg-gray-800/30 transition-colors"
+                          >
+                            {enableEditing && isEditMode && (
+                              <TableCell className="border-r border-gray-700 p-2 w-12 flex-shrink-0">
+                                <Button
+                                  variant="ghost"
+                                  size="sm"
+                                  onClick={() => handleDeleteRow(rowIndex)}
+                                  className="h-6 w-6 p-0 text-red-400 hover:text-red-300 hover:bg-red-400/10"
+                                  title="Delete row"
+                                >
+                                  <Trash2 className="h-3 w-3" />
+                                </Button>
+                              </TableCell>
+                            )}
+                            {row.map((cell: any, cellIndex: number) => {
+                              const columnInfo = detailedColumns[cellIndex];
+                              const enumValues = columnInfo ? enumValuesCache.get(columnInfo.udt_name) || [] : [];
+                              const foreignKeyInfo = columnInfo ? foreignKeysInfo.get(columnInfo.name) : undefined;
+                              
+                              return (
+                                <TableCell 
+                                  key={cellIndex} 
+                                  className="border-r border-gray-700 last:border-r-0 text-sm p-0 min-w-[120px] flex-shrink-0"
+                                >
+                                  {isEditMode && columnInfo ? (
+                                    <EditableCell
+                                      value={cell}
+                                      columnInfo={columnInfo}
+                                      onSave={(newValue) => updateCellValue(rowIndex, cellIndex, newValue)}
+                                      enumValues={enumValues}
+                                      rowIndex={rowIndex}
+                                      columnIndex={cellIndex}
+                                      onOpenRelatedTable={(tableName, schemaName, foreignKeyValue, columnName) => 
+                                        handleOpenRelatedTableInline(rowIndex, tableName, schemaName, foreignKeyValue, columnName, foreignKeyInfo)
+                                      }
+                                      foreignKeyInfo={foreignKeyInfo}
+                                    />
+                                  ) : (
+                                    <div 
+                                      className={`font-mono truncate p-2 min-h-[32px] flex items-center justify-between ${getCellClassName(cell)} ${columnInfo?.is_foreign_key && cell !== null && cell !== undefined ? 'cursor-pointer hover:bg-blue-900/20' : ''}`}
+                                      title={
+                                        columnInfo?.is_foreign_key && foreignKeyInfo
+                                          ? `Foreign Key → ${foreignKeyInfo.referenced_table}.${foreignKeyInfo.referenced_column} • Click to open related table inline`
+                                          : formatCellValue(cell)
+                                      }
+                                      onClick={() => {
+                                        console.log('🔧 [ResultsViewer] Cell clicked (non-edit mode):', {
+                                          isForeignKey: columnInfo?.is_foreign_key,
+                                          hasForeignKeyInfo: !!foreignKeyInfo,
+                                          cell,
+                                          foreignKeyInfo
+                                        });
+
+                                        if (columnInfo?.is_foreign_key && foreignKeyInfo && cell !== null && cell !== undefined) {
+                                          console.log('🔧 [ResultsViewer] Opening related table inline');
+                                          handleOpenRelatedTableInline(
+                                            rowIndex,
+                                            foreignKeyInfo.referenced_table,
+                                            foreignKeyInfo.referenced_schema || 'public',
+                                            cell,
+                                            foreignKeyInfo.referenced_column,
+                                            foreignKeyInfo
+                                          );
+                                        } else {
+                                          console.log('🔧 [ResultsViewer] Conditions not met for opening related table');
+                                        }
+                                      }}
+                                    >
+                                      <div className="flex flex-col flex-1 min-w-0">
+                                        <span className="truncate">
+                                          {formatCellValue(cell)}
+                                        </span>
+                                        {columnInfo?.is_foreign_key && foreignKeyInfo && cell !== null && cell !== undefined && (
+                                          <div className="text-xs text-gray-400 truncate mt-1">
+                                            <span className="text-purple-300">→ {foreignKeyInfo.referenced_table}</span>
+                                            <span className="text-gray-500 ml-1">({foreignKeyInfo.referenced_column}: {formatCellValue(cell)})</span>
+                                            {expandedRows.has(rowIndex) && (
+                                              <span className="ml-2 text-blue-400">▼ expanded</span>
+                                            )}
+                                          </div>
+                                        )}
+                                      </div>
+                                      <div className="flex items-center ml-2 flex-shrink-0">
+                                        {columnInfo?.is_primary_key && (
+                                          <span className="text-yellow-400 text-xs" title="Primary Key">🔑</span>
+                                        )}
+                                        {columnInfo?.is_foreign_key && (
+                                          <span className="text-purple-400 text-xs ml-1" title="Foreign Key">🔗</span>
+                                        )}
+                                      </div>
+                                    </div>
+                                  )}
+                                </TableCell>
+                              );
+                            })}
+                          </TableRow>
+
+                          {/* Expanded related table row */}
+                          {expandedRows.has(rowIndex) && (
+                            <TableRow key={`expanded-${rowIndex}`} className="border-gray-700">
+                              <TableCell 
+                                colSpan={displayData?.columns.length || 0} 
+                                className="p-0 border-r border-gray-700 last:border-r-0"
+                              >
+                                <div className="bg-blue-900/10 border-l-4 border-blue-500">
+                                  {(() => {
+                                    const expandedData = expandedRows.get(rowIndex)!;
+                                    return (
+                                      <div className="p-4">
+                                        {/* Header for the related table */}
+                                        <div className="flex items-center justify-between mb-3 pb-2 border-b border-blue-500/30">
+                                          <div className="flex items-center space-x-2">
+                                            <span className="text-blue-300 font-medium text-sm">
+                                              Related: {expandedData.schemaName}.{expandedData.tableName}
+                                            </span>
+                                            <Badge variant="outline" className="text-xs border-blue-500/30 text-blue-300">
+                                              {expandedData.filterInfo.columnName} = {String(expandedData.filterInfo.value)}
+                                            </Badge>
+                                            <span className="text-xs text-gray-400">
+                                              ({expandedData.queryResult.rows.length} rows)
+                                            </span>
+                                          </div>
+                                          <Button
+                                            variant="ghost"
+                                            size="sm"
+                                            onClick={() => setExpandedRows(prev => {
+                                              const newMap = new Map(prev);
+                                              newMap.delete(rowIndex);
+                                              return newMap;
+                                            })}
+                                            className="h-6 w-6 p-0 text-gray-400 hover:text-gray-300"
+                                          >
+                                            <X className="h-3 w-3" />
+                                          </Button>
+                                        </div>
+
+                                        {/* Related table content */}
+                                        <div className="max-h-96 overflow-auto">
+                                          <ResultsViewer
+                                            queryResult={expandedData.queryResult}
+                                            isExecuting={false}
+                                            enableEditing={true}
+                                            tableName={expandedData.tableName}
+                                            schemaName={expandedData.schemaName}
+                                            onQueryResultUpdate={(updatedResult) => {
+                                              if (updatedResult) {
+                                                setExpandedRows(prev => {
+                                                  const newMap = new Map(prev);
+                                                  const current = newMap.get(rowIndex);
+                                                  if (current) {
+                                                    newMap.set(rowIndex, {
+                                                      ...current,
+                                                      queryResult: updatedResult
+                                                    });
+                                                  }
+                                                  return newMap;
+                                                });
+                                              }
+                                            }}
+                                            onOpenRelatedTable={onOpenRelatedTable}
+                                          />
+                                        </div>
+                                      </div>
+                                    );
+                                  })()}
+                                </div>
+                              </TableCell>
+                            </TableRow>
+                          )}
+                        </>
+                      ))}
+                      </TableBody>
+                    </Table>
+                  </div>
+                )}
+              </div>
+
+              {/* Pagination controls - bottom */}
+              {queryResult.pagination && (
+                <div className="flex items-center justify-center space-x-2">
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    onClick={() => handlePageChange(1)}
+                    disabled={currentPage <= 1}
+                    className="border-gray-600 text-gray-300 hover:bg-gray-700"
+                  >
+                    First
+                  </Button>
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    onClick={() => handlePageChange(currentPage - 1)}
+                    disabled={currentPage <= 1}
+                    className="border-gray-600 text-gray-300 hover:bg-gray-700"
+                  >
+                    <ChevronLeft className="h-4 w-4 mr-1" />
+                    Previous
+                  </Button>
+                  <span className="text-sm text-gray-400 px-4">
+                    Page {currentPage} of {totalPages}
+                  </span>
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    onClick={() => handlePageChange(currentPage + 1)}
+                    disabled={!hasMore && (!totalRows || currentPage >= totalPages)}
+                    className="border-gray-600 text-gray-300 hover:bg-gray-700"
+                  >
+                    Next
+                    <ChevronRight className="h-4 w-4 ml-1" />
+                  </Button>
+                  {totalRows && (
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      onClick={() => handlePageChange(totalPages)}
+                      disabled={currentPage >= totalPages}
+                      className="border-gray-600 text-gray-300 hover:bg-gray-700"
+                    >
+                      Last
+                    </Button>
+                  )}
+                </div>
+              )}
+            </>
+          )}
+        </CardContent>
+      </Card>
+
+      {/* Insert Row Dialog */}
+      <Dialog open={showInsertDialog} onOpenChange={setShowInsertDialog}>
+        <DialogContent className="bg-gray-800 border-gray-700 text-white max-w-2xl max-h-[80vh] overflow-y-auto">
+          <DialogHeader>
+            <DialogTitle className="flex items-center space-x-2">
+              <Plus className="h-5 w-5 text-green-400" />
+              <span>Insert New Row</span>
+            </DialogTitle>
+            <DialogDescription className="text-gray-400">
+              Add a new row to {tableName}. Fill in the required fields and click Insert.
+            </DialogDescription>
+          </DialogHeader>
+          
+          <div className="space-y-4 py-4">
+            {detailedColumns.map((column, index) => {
+              const enumValues = enumValuesCache.get(column.udt_name) || [];
+              const isAutoGenerated = column.default_value?.includes('nextval(');
+              
+              return (
+                <div key={column.name} className="space-y-2">
+                  <div className="flex items-center space-x-2">
+                    <label className="text-sm font-medium text-gray-300 min-w-0 flex-1">
+                      {column.name}
+                      {!column.is_nullable && !isAutoGenerated && (
+                        <span className="text-red-400 ml-1">*</span>
+                      )}
+                      {column.is_primary_key && (
+                        <span className="text-yellow-400 text-xs ml-1" title="Primary Key">🔑</span>
+                      )}
+                    </label>
+                    <span className="text-xs text-gray-500">
+                      {column.data_type} {column.is_nullable ? '(nullable)' : '(required)'}
+                    </span>
+                  </div>
+                  
+                  {isAutoGenerated ? (
+                    <div className="text-xs text-gray-500 italic p-2 bg-gray-900/50 rounded border border-gray-600">
+                      Auto-generated value
+                    </div>
+                  ) : (
+                    <EditableCell
+                      value={newRowData[column.name]}
+                      columnInfo={column}
+                      onSave={(newValue) => {
+                        setNewRowData(prev => ({
+                          ...prev,
+                          [column.name]: newValue
+                        }));
+                      }}
+                      enumValues={enumValues}
+                      rowIndex={-1}
+                      columnIndex={index}
+                    />
+                  )}
+                </div>
+              );
+            })}
+          </div>
+          
+          <DialogFooter>
+            <Button
+              variant="outline"
+              onClick={() => {
+                setShowInsertDialog(false);
+                setNewRowData({});
+              }}
+              className="border-gray-600 text-gray-300 hover:bg-gray-700"
+            >
+              Cancel
+            </Button>
+            <Button
+              onClick={handleInsertConfirm}
+              disabled={isInserting}
+              className="bg-green-600 text-white hover:bg-green-700"
+            >
+              {isInserting ? (
+                <>
+                  <div className="animate-spin rounded-full h-4 w-4 border-b-2 border-white mr-2"></div>
+                  Inserting...
+                </>
+              ) : (
+                <>
+                  <Plus className="h-4 w-4 mr-2" />
+                  Insert Row
+                </>
+              )}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      {/* Delete Row Dialog */}
+      <Dialog open={showDeleteDialog} onOpenChange={setShowDeleteDialog}>
+        <DialogContent className="bg-gray-800 border-gray-700 text-white">
+          <DialogHeader>
+            <DialogTitle className="flex items-center space-x-2">
+              <AlertTriangle className="h-5 w-5 text-red-400" />
+              <span>Confirm Delete</span>
+            </DialogTitle>
+            <DialogDescription className="text-gray-400">
+              Are you sure you want to delete this row? This action cannot be undone.
+            </DialogDescription>
+          </DialogHeader>
+          
+          {deleteRowIndex !== null && queryResult && (
+            <div className="py-4">
+              <div className="bg-red-900/20 border border-red-500/30 rounded p-3">
+                <div className="text-sm text-gray-300 mb-2">Row to be deleted:</div>
+                <div className="space-y-1 max-h-32 overflow-y-auto">
+                  {queryResult.columns.map((columnName, index) => {
+                    const value = queryResult.rows[deleteRowIndex][index];
+                    return (
+                      <div key={columnName} className="flex justify-between text-xs">
+                        <span className="text-gray-400 font-medium">{columnName}:</span>
+                        <span className="text-gray-300 font-mono">
+                          {formatCellValue(value)}
+                        </span>
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+            </div>
+          )}
+          
+          <DialogFooter>
+            <Button
+              variant="outline"
+              onClick={() => {
+                setShowDeleteDialog(false);
+                setDeleteRowIndex(null);
+              }}
+              className="border-gray-600 text-gray-300 hover:bg-gray-700"
+            >
+              Cancel
+            </Button>
+            <Button
+              onClick={handleDeleteConfirm}
+              disabled={isDeleting}
+              className="bg-red-600 text-white hover:bg-red-700"
+            >
+              {isDeleting ? (
+                <>
+                  <div className="animate-spin rounded-full h-4 w-4 border-b-2 border-white mr-2"></div>
+                  Deleting...
+                </>
+              ) : (
+                <>
+                  <Trash2 className="h-4 w-4 mr-2" />
+                  Delete Row
+                </>
+              )}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      {/* Filter Dialog */}
+      <Dialog open={showFilterDialog} onOpenChange={setShowFilterDialog}>
+        <DialogContent className="bg-gray-900 border-gray-600 text-white max-w-md">
+          <DialogHeader>
+            <DialogTitle className="flex items-center space-x-2 text-white">
+              <Filter className="h-5 w-5 text-purple-400" />
+              <span>Add Filter</span>
+            </DialogTitle>
+            <DialogDescription className="text-gray-300">
+              Create a filter condition to narrow down the results.
+            </DialogDescription>
+          </DialogHeader>
+          
+          <div className="space-y-4">
+            {/* Column selector */}
+            <div>
+              <label className="text-sm font-medium text-white mb-2 block">Column</label>
+              <Select value={newFilter.column} onValueChange={handleColumnChange}>
+                <SelectTrigger className="bg-gray-800 border-gray-500 text-white hover:bg-gray-700 hover:border-gray-400 focus:border-purple-400 focus:ring-1 focus:ring-purple-400">
+                  <SelectValue placeholder="Select column" />
+                </SelectTrigger>
+                <SelectContent className="bg-gray-800 border-gray-500">
+                  {(queryResult?.columns || []).map((column) => {
+                    const columnInfo = detailedColumns.find(col => col.name === column);
+                    return (
+                      <SelectItem key={column} value={column} className="text-white hover:bg-gray-700 focus:bg-gray-700">
+                        <div className="flex items-center space-x-2">
+                          <span className="text-white">{column}</span>
+                          {columnInfo && (
+                            <span className="text-xs text-gray-300">
+                              ({columnInfo.data_type}
+                              {columnInfo.is_foreign_key && ' FK'}
+                              {enumValuesCache.has(columnInfo.udt_name) && ' enum'}
+                              {columnInfo.data_type.toLowerCase().includes('bool') && ' bool'})
+                            </span>
+                          )}
+                        </div>
+                      </SelectItem>
+                    );
+                  })}
+                </SelectContent>
+              </Select>
+            </div>
+
+            {/* Operator selector */}
+            <div>
+              <label className="text-sm font-medium text-white mb-2 block">Operator</label>
+              <Select value={newFilter.operator} onValueChange={(value) => setNewFilter(prev => ({ ...prev, operator: value }))}>
+                <SelectTrigger className="bg-gray-800 border-gray-500 text-white hover:bg-gray-700 hover:border-gray-400 focus:border-purple-400 focus:ring-1 focus:ring-purple-400">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent className="bg-gray-800 border-gray-500">
+                  <SelectItem value="=" className="text-white hover:bg-gray-700 focus:bg-gray-700">=</SelectItem>
+                  <SelectItem value="!=" className="text-white hover:bg-gray-700 focus:bg-gray-700">!=</SelectItem>
+                  <SelectItem value=">" className="text-white hover:bg-gray-700 focus:bg-gray-700">&gt;</SelectItem>
+                  <SelectItem value="<" className="text-white hover:bg-gray-700 focus:bg-gray-700">&lt;</SelectItem>
+                  <SelectItem value=">=" className="text-white hover:bg-gray-700 focus:bg-gray-700">&gt;=</SelectItem>
+                  <SelectItem value="<=" className="text-white hover:bg-gray-700 focus:bg-gray-700">&lt;=</SelectItem>
+                  <SelectItem value="LIKE" className="text-white hover:bg-gray-700 focus:bg-gray-700">LIKE</SelectItem>
+                  <SelectItem value="ILIKE" className="text-white hover:bg-gray-700 focus:bg-gray-700">ILIKE</SelectItem>
+                  <SelectItem value="IS NULL" className="text-white hover:bg-gray-700 focus:bg-gray-700">IS NULL</SelectItem>
+                  <SelectItem value="IS NOT NULL" className="text-white hover:bg-gray-700 focus:bg-gray-700">IS NOT NULL</SelectItem>
+                </SelectContent>
+              </Select>
+            </div>
+
+            {/* Value input */}
+            {newFilter.operator !== 'IS NULL' && newFilter.operator !== 'IS NOT NULL' && (
+              <div>
+                <label className="text-sm font-medium text-white mb-2 block">Value</label>
+                
+                {/* Show suggestions if available */}
+                {filterSuggestions.length > 0 ? (
+                  <div className="space-y-2">
+                    <Select value={newFilter.value} onValueChange={(value) => setNewFilter(prev => ({ ...prev, value }))}>
+                      <SelectTrigger className="bg-gray-800 border-gray-500 text-white hover:bg-gray-700 hover:border-gray-400 focus:border-purple-400 focus:ring-1 focus:ring-purple-400">
+                        <SelectValue placeholder="Select or type a value" />
+                      </SelectTrigger>
+                      <SelectContent className="bg-gray-800 border-gray-500 max-h-48">
+                        {filterSuggestions.map((suggestion, index) => {
+                          // Extract the actual value (before parentheses) and display text
+                          const actualValue = suggestion.includes(' (') ? suggestion.split(' (')[0] : suggestion;
+                          return (
+                            <SelectItem key={index} value={actualValue} className="text-white hover:bg-gray-700 focus:bg-gray-700">
+                              {suggestion}
+                            </SelectItem>
+                          );
+                        })}
+                      </SelectContent>
+                    </Select>
+                    <div className="text-xs text-gray-300">
+                      Or type a custom value:
+                    </div>
+                    <Input
+                      value={newFilter.value}
+                      onChange={(e) => setNewFilter(prev => ({ ...prev, value: e.target.value }))}
+                      placeholder="Enter custom value"
+                      className="bg-gray-800 border-gray-500 text-white placeholder-gray-400 hover:border-gray-400 focus:border-purple-400 focus:ring-1 focus:ring-purple-400"
+                    />
+                  </div>
+                ) : (
+                  <div className="space-y-2">
+                    <Input
+                      value={newFilter.value}
+                      onChange={(e) => setNewFilter(prev => ({ ...prev, value: e.target.value }))}
+                      placeholder="Enter filter value"
+                      className="bg-gray-800 border-gray-500 text-white placeholder-gray-400 hover:border-gray-400 focus:border-purple-400 focus:ring-1 focus:ring-purple-400"
+                    />
+                    {loadingSuggestions && (
+                      <div className="flex items-center space-x-2 text-xs text-gray-300">
+                        <div className="animate-spin rounded-full h-3 w-3 border-b-2 border-purple-400"></div>
+                        <span>Loading suggestions...</span>
+                      </div>
+                    )}
+                  </div>
+                )}
+              </div>
+            )}
+
+            {/* Current filters */}
+            {filters.length > 0 && (
+              <div>
+                <label className="text-sm font-medium text-white mb-2 block">Current Filters</label>
+                <div className="space-y-2">
+                  {filters.map((filter, index) => (
+                    <div key={index} className="flex items-center justify-between bg-gray-800 border border-gray-500 rounded p-3">
+                      <span className="text-sm text-white font-medium">
+                        <span className="text-purple-300">{filter.column}</span>{' '}
+                        <span className="text-blue-300">{filter.operator}</span>{' '}
+                        {!filter.operator.includes('NULL') && (
+                          <span className="text-green-300">{filter.value}</span>
+                        )}
+                      </span>
+                      <Button
+                        variant="ghost"
+                        size="sm"
+                        onClick={() => handleRemoveFilter(index)}
+                        className="h-6 w-6 p-0 text-red-400 hover:text-red-300 hover:bg-red-500/20"
+                      >
+                        <X className="h-3 w-3" />
+                      </Button>
+                    </div>
+                  ))}
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    onClick={handleClearFilters}
+                    className="w-full border-gray-500 text-white hover:bg-gray-700 hover:border-gray-400"
+                  >
+                    Clear All Filters
+                  </Button>
+                </div>
+              </div>
+            )}
+          </div>
+          
+          <DialogFooter className="gap-3">
+            <Button
+              variant="outline"
+              onClick={() => {
+                setShowFilterDialog(false);
+                setNewFilter({ column: '', operator: '=', value: '' });
+                setFilterSuggestions([]);
+              }}
+              className="border-gray-600 text-gray-300 hover:bg-gray-700 hover:text-white hover:border-gray-500 transition-colors"
+            >
+              Cancel
+            </Button>
+            <Button
+              onClick={handleAddFilter}
+              disabled={!newFilter.column || (!newFilter.value && !newFilter.operator.includes('NULL'))}
+              className="bg-purple-600 text-white hover:bg-purple-700 disabled:bg-gray-700 disabled:text-gray-500 disabled:cursor-not-allowed transition-colors shadow-lg"
+            >
+              <Filter className="h-4 w-4 mr-2" />
+              Add Filter
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      {/* Import SQL Dialog */}
+      <Dialog open={showImportDialog} onOpenChange={setShowImportDialog}>
+        <DialogContent className="bg-gray-800 border-gray-700 text-white">
+          <DialogHeader>
+            <DialogTitle className="flex items-center space-x-2 text-white">
+              <Upload className="h-5 w-5 text-green-400" />
+              <span>Import SQL Data</span>
+            </DialogTitle>
+            <DialogDescription className="text-gray-300">
+              Select an SQL file to import data into the database.
+            </DialogDescription>
+          </DialogHeader>
+          
+          <div className="space-y-4">
+            <Alert className="border-yellow-500/20 bg-yellow-500/10">
+              <AlertTriangle className="h-4 w-4 text-yellow-400" />
+              <AlertDescription className="text-yellow-300">
+                <strong>Warning:</strong> This will execute SQL statements from the file. 
+                Make sure you trust the source and have reviewed the content.
+              </AlertDescription>
+            </Alert>
+            
+            <div className="text-sm text-gray-300">
+              <p><strong>Supported formats:</strong></p>
+              <ul className="list-disc list-inside mt-2 space-y-1">
+                <li>INSERT statements</li>
+                <li>UPDATE statements</li>
+                <li>DELETE statements</li>
+                <li>CREATE TABLE statements</li>
+              </ul>
+            </div>
+          </div>
+          
+          <DialogFooter>
+            <Button
+              variant="outline"
+              onClick={() => setShowImportDialog(false)}
+              className="border-gray-600 text-gray-300 hover:bg-gray-700"
+            >
+              Cancel
+            </Button>
+            <Button
+              onClick={handleImportFile}
+              disabled={isImporting}
+              className="bg-green-600 text-white hover:bg-green-700"
+            >
+              {isImporting ? (
+                <>
+                  <div className="animate-spin rounded-full h-4 w-4 border-b-2 border-white mr-2"></div>
+                  Importing...
+                </>
+              ) : (
+                <>
+                  <Upload className="h-4 w-4 mr-2" />
+                  Select File & Import
+                </>
+              )}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+    </div>
+  );
+}

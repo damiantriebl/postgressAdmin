@@ -1,0 +1,24 @@
+
+{
+  "hooks": [
+    {
+      "name": "on_save_migration",
+      "trigger": "file_save",
+      "paths": ["migrations/*.sql"],
+      "action": {
+        "type": "run",
+        "script": "npm run lint:migration && cargo test"
+      },
+      "description": "Al guardar un script SQL, lint + tests backend"
+    },
+    {
+      "name": "doc_sync",
+      "trigger": "migration_applied",
+      "action": {
+        "type": "exec",
+        "script": "npm run generate-docs"
+      },
+      "description": "Cuando se aplica migration, actualizar documentación"
+    }
+  ]
+}
