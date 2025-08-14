@@ -97,8 +97,8 @@ pub async fn retrieve_profile_credentials(
             log::info!("Retrieved credentials for profile: {}", profile_id);
             Ok(RetrieveCredentialsResponse {
                 success: true,
-                username: Some(credentials.username),
-                password: Some(credentials.password),
+                username: Some(credentials.username.clone()),
+                password: Some(credentials.password.clone()),
                 message: "Credentials retrieved successfully".to_string(),
                 encrypted_at: Some(credentials.encrypted_at.to_rfc3339()),
             })

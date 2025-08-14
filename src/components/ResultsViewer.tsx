@@ -1,7 +1,7 @@
 import { useState, useEffect } from "react";
-import { 
-  ChevronLeft, 
-  ChevronRight, 
+import {
+  ChevronLeft,
+  ChevronRight,
   Hash,
   Clock,
   Database,
@@ -39,24 +39,24 @@ interface ResultsViewerProps {
   onOpenRelatedTable?: (tableName: string, schemaName: string, foreignKeyValue: any, columnName: string) => void;
 }
 
-export default function ResultsViewer({ 
-  queryResult, 
-  isLoading, 
-  tableName, 
+export default function ResultsViewer({
+  queryResult,
+  isLoading,
+  tableName,
   schemaName,
   enableEditing = false,
   onQueryResultUpdate,
-  onOpenRelatedTable 
+  onOpenRelatedTable
 }: ResultsViewerProps) {
   const { addToast } = useToast();
-  
+
   // Basic state
   const [displayData, setDisplayData] = useState<QueryResult | null>(null);
   const [currentPage, setCurrentPage] = useState(1);
   const [pageSize, setPageSize] = useState(100);
   // isExporting state removed - handled by ExportDialog
   const [showImportDialog, setShowImportDialog] = useState(false);
-  
+
   // Edit mode state
   const [isEditMode, setIsEditMode] = useState(false);
   const [detailedColumns, setDetailedColumns] = useState<DetailedColumnInfo[]>([]);
@@ -76,21 +76,21 @@ export default function ResultsViewer({
       if (enableEditing && tableName && queryResult) {
         try {
           console.log('🔧 [ResultsViewer] Loading detailed columns for table:', tableName, schemaName);
-          
+
           const [columns, foreignKeys] = await Promise.all([
             DatabaseService.getDetailedTableColumns(tableName, schemaName),
             DatabaseService.getTableForeignKeys(tableName, schemaName)
           ]);
-          
+
           setDetailedColumns(columns);
-          
+
           // Build foreign keys map
           const fkMap = new Map();
           foreignKeys.forEach((fk: any) => {
             fkMap.set(fk.column_name, fk);
           });
           setForeignKeysInfo(fkMap);
-          
+
           console.log('🔧 [ResultsViewer] Loaded detailed columns and foreign keys:', columns.length, foreignKeys.length);
         } catch (error) {
           console.error('🚨 [ResultsViewer] Error loading detailed columns:', error);
@@ -108,6 +108,13 @@ export default function ResultsViewer({
 
   // Toggle edit mode
   const toggleEditMode = () => {
+    console.log('🔧 [ResultsViewer] Toggling edit mode from:', isEditMode, 'to:', !isEditMode);
+    console.log('🔧 [ResultsViewer] Current state:', {
+      tableName,
+      enableEditing,
+      detailedColumnsLength: detailedColumns.length,
+      hasData: displayData?.rows.length || 0
+    });
     setIsEditMode(!isEditMode);
   };
 
@@ -118,7 +125,7 @@ export default function ResultsViewer({
     try {
       const column = detailedColumns[columnIndex];
       const primaryKeyColumns = detailedColumns.filter(col => col.is_primary_key);
-      
+
       if (primaryKeyColumns.length === 0) {
         throw new Error('Cannot update: table has no primary key');
       }
@@ -150,7 +157,7 @@ export default function ResultsViewer({
       const updatedData = { ...displayData };
       updatedData.rows[rowIndex][columnIndex] = newValue;
       setDisplayData(updatedData);
-      
+
       if (onQueryResultUpdate) {
         onQueryResultUpdate(updatedData);
       }
@@ -185,7 +192,7 @@ export default function ResultsViewer({
 
       if (filePath) {
         setIsImporting(true);
-        
+
         const importOptions: ImportOptions = {
           format: "SQL" as any,
           table_name: tableName,
@@ -294,8 +301,8 @@ export default function ResultsViewer({
                     size="sm"
                     onClick={toggleEditMode}
                     disabled={(displayData?.rows.length || 0) === 0}
-                    className={isEditMode 
-                      ? "bg-blue-600 text-white hover:bg-blue-700" 
+                    className={isEditMode
+                      ? "bg-blue-600 text-white hover:bg-blue-700"
                       : "border-gray-600 text-gray-300 hover:bg-gray-700"
                     }
                   >
@@ -305,7 +312,7 @@ export default function ResultsViewer({
                   <Button
                     variant="outline"
                     size="sm"
-                    onClick={() => {/* TODO: handleInsertRow */}}
+                    onClick={() => {/* TODO: handleInsertRow */ }}
                     disabled={!tableName || detailedColumns.length === 0}
                     className="border-green-600 text-green-300 hover:bg-green-700/20"
                   >
@@ -359,7 +366,7 @@ export default function ResultsViewer({
               </div>
             </div>
           )}
-          
+
           {(displayData?.rows.length || 0) === 0 ? (
             <Alert className="glass-effect border-blue-500/20 bg-blue-500/10">
               <Database className="h-4 w-4 text-blue-400" />
@@ -391,7 +398,7 @@ export default function ResultsViewer({
                           const columnInfo = detailedColumns[cellIndex];
                           const enumValues = columnInfo ? enumValuesCache.get(columnInfo.udt_name) || [] : [];
                           const foreignKeyInfo = columnInfo ? foreignKeysInfo.get(columnInfo.name) : undefined;
-                          
+
                           return (
                             <TableCell key={cellIndex} className="border-r border-gray-700 last:border-r-0 text-sm p-0 min-w-[120px] flex-shrink-0">
                               {isEditMode && columnInfo ? (
@@ -402,7 +409,7 @@ export default function ResultsViewer({
                                   enumValues={enumValues}
                                   rowIndex={startIndex + rowIndex}
                                   columnIndex={cellIndex}
-                                  onOpenRelatedTable={(tableName, schemaName, foreignKeyValue, columnName) => 
+                                  onOpenRelatedTable={(tableName, schemaName, foreignKeyValue, columnName) =>
                                     onOpenRelatedTable && onOpenRelatedTable(tableName, schemaName, foreignKeyValue, columnName)
                                   }
                                   foreignKeyInfo={foreignKeyInfo}

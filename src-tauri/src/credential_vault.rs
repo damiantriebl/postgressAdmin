@@ -7,9 +7,8 @@ use chrono::{DateTime, Utc};
 use keyring::Entry;
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+
 use thiserror::Error;
-use uuid::Uuid;
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
 /// Errors that can occur during credential vault operations
@@ -38,13 +37,22 @@ pub enum VaultError {
 }
 
 /// Secure credentials structure with automatic zeroization
-#[derive(Debug, Clone, Serialize, Deserialize, Zeroize, ZeroizeOnDrop)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Credentials {
     pub username: String,
-    #[zeroize(skip)]
     pub password: String,
     pub encrypted_at: DateTime<Utc>,
 }
+
+impl Zeroize for Credentials {
+    fn zeroize(&mut self) {
+        self.username.zeroize();
+        self.password.zeroize();
+        // Note: DateTime doesn't implement Zeroize, but that's OK for timestamps
+    }
+}
+
+impl ZeroizeOnDrop for Credentials {}
 
 /// Encrypted credentials stored in keyring
 #[derive(Debug, Serialize, Deserialize)]
@@ -89,7 +97,7 @@ impl CredentialVault {
         match master_key_entry.get_password() {
             Ok(key_data) => {
                 // Try to load existing master key
-                let key_info: MasterKeyInfo = serde_json::from_str(&key_data)?;
+                let _key_info: MasterKeyInfo = serde_json::from_str(&key_data)?;
                 
                 // For security, we generate a new key each time
                 // In a production system, you might want to derive from a user password

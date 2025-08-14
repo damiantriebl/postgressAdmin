@@ -58,7 +58,7 @@ pub enum SortDirection {
 }
 
 /// Profile storage metadata
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct StorageMetadata {
     version: String,
     created_at: DateTime<Utc>,
@@ -141,7 +141,7 @@ impl ConnectionProfileStore {
         metadata.profile_count = profiles.len();
 
         let stored_data = StoredProfileData {
-            metadata: metadata.clone(),
+            metadata: (*metadata).clone(),
             profiles: profiles.values().cloned().collect(),
         };
 
