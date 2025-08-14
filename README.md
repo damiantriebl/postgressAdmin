@@ -88,10 +88,14 @@ Configs: vite.config.ts, tailwind.config.js, tsconfig*.json
 
 Run Locally
 pnpm tauri dev
-# Opens the desktop app; Rust backend logs in console
+# Opens the desktop app, Rust backend logs in console
 
 Build
+
+```
 pnpm tauri build
+```
+
 # Binary output in src-tauri/target/release
 
 Troubleshooting (Windows)
